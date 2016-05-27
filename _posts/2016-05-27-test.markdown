@@ -1,0 +1,194 @@
+---
+layout: post
+title:  "结构化日志"
+date:   2016-05-27 17:34:59 +0800
+categories: logging translation ruby rails
+---
+
+**译自[https://kartar.net/2015/12/structured-logging/](https://kartar.net/2015/12/structured-logging/)**
+  
+*这是另一篇在写[The Art of Monitoring](http://artofmonitoring.com/)时启发而成的文章。 你可以在那个网站上加入邮件列表来获取更多信息。*
+
+多数的日志机制产生的日志条目含有一个字符串值：消息信息或者错误描述。Syslog就是一个经典例子，被很多主机，服务和应用程序来用作为默认的日志格式。下面是一个典型的Syslog：
+
+```ruby
+Dec  6 23:17:01 logstash CRON[5849]: (root) CMD (cd / && run-parts --report /etc/cron.hourly)
+```
+
+在这个Cron job报告的例子里，除了负载之外还有时间戳和来源（主机名`logstash`）。虽然有着通用性和可读性，Syslog格式并不是很理想，因为它基本就是一段长字符串。这段字符串从人类可读性的的角度来说很棒，一看就知道发生了什么。但是你是这一段字符串消息的目标受众吗？可能之前主机数量不多的时候，你作为受众连上主机去读取这些日志。现在你有了一大堆主机，服务和应用程序并且你的日志条目被集中化了，这就意味着在人类受众之前，现在有机器要使用这些日志优先于你看这些日志，而且高可读的字符串格式是不太容易被使用的。
+
+我们很可能被迫要用不止一个正则表达式来解析这段格式。重申一下，Syslog是一个很好的例子。[跨平台的实现有时还有略微不同，这通尝意味着需要实现和维护一个以上的正则表达式](http://kartar.net/2014/09/when-logstash-and-syslog-go-wrong/)。这个额外开支使得要从我们的日志数据上要抽取有效的信息是相当困难的。
+
+不过有一个方式可以更好地生成日志：结构化日志（也被称作语义化或者类型化日志）。现在结构化日志还没有一个标准，现在有一些案例尝试着去标准化一个结构化数据的格式，比如[Common Event Expression](https://cee.mitre.org/) 和 [Project Lumberjack](https://fedorahosted.org/lumberjack/)。不过他们都不是很给力并且维护性较差。但我们仍然可以描述结构化日志的概念。作为诸如Syslog例子里那段字符串的替代，结构化日志保留了类型、富数据而不是单纯转换。来看看一段生成非结构化日志代码的例子：
+
+```ruby
+Logger.error("The system had a hiccup trying to create user" + username)
+```
+
+假设用`james@example.com`来生成一个用户。这段伪代码会生成下面的消息：
+
+```
+The system had a hiccup trying to create user james@example.com.
+```
+
+之后把这段日志发送出去， 例如Logstash，来把消息解析成一个有用的形式。
+
+
+我们也可以生成一条更为结构化的消息。
+
+```ruby
+Logger.error(event="user_creation_failed", user=username)
+```
+
+你可以看到在结构化消息里，我们在任何解析开始之前就有了一个优势。假设我们以示例中的JSN，或者类似协议缓冲的binary格式发送了日志消息，然后我们得到了一个名叫`user_creation_failed`的`event`，和一个包含了生成失败用户的用户名的`user`变量（甚至一个用户对象包含了生成用户的所有参数）。
+
+来看看我们用JSON编码过的event可能像这样：
+
+```json
+[
+  {
+    "time":1449454008,
+    "priority":"error",
+    "event":"user_creation_failed",
+    "user":"james@example.com"
+  }
+]
+```
+
+可以看到一个包含了结构化日志条目的JSON数组取代了单纯的字符串：time，priority，event标识，和用户创建失败事件带来的一些富信息。我们记录了一系列的对象，能够很简单的被机器识别而不是需要我们自己去解析的一段字符串。
+
+
+让我们举一个用结构化日志扩展Rails应用程序的例子。这是一个简单的Ruby on Rails程序，只有创建和删除用户和其他一点点的功能。我们要加两个结构化日志的库到程序里，一个叫[Lograge](https://github.com/roidrage/lograge)，一个叫[Logstash-logger](https://github.com/dwbutler/logstash-logger)。Lograge把Rails风格的请求日志格式化成了一个结构化的形势，默认用JSON格式，也可以用Logstash-structured events格式。第二个库Logstash-logger，允许我们拦截Rails内的日志框架并且生成更为结构化的事件把他们直接发送到Logstash里。把他们安装起来，来看看结构化的消息长什么样。
+
+
+我们先要添加`lograge`，`logstash-event`和`logstash-logger`，3个gem到我们的应用程序来增加对结构化日志功能的支持。
+
+
+`lograge` gem能够使Lograge的请求日志重新格式化。`logstash-event`gem允许Lograge格式化请求变为Logstash事件。`logstash-logger`gem允许以Logstash事件的格式去输出日志事件并且允许使用各种可能的包括Logstash在内的日志目的地。我们先来把这些gem添加到Rails应用程序的`Gemfile`。
+
+```
+source 'https://rubygems.org'
+ruby '2.2.2'
+gem 'rails', '4.2.4'
+. . .
+gem 'lograge'
+gem 'logstash-event'
+gem 'logstash-logger'
+. . .
+```
+
+然后用`bundle`命令安装gem。
+
+```
+$ sudo bundle install
+Fetching gem metadata from https://rubygems.org/...........
+Fetching version metadata from https://rubygems.org/...
+Fetching dependency metadata from https://rubygems.org/..
+. . .
+Installing lograge
+Installing logstash-event
+Installing logstash-logger
+. . .
+```
+
+接下来需要在Rails应用程序的配置里启用新的日志组件。我们在`config/environments/production.rb`文件中添加配置，只在`production`环境启用组件。
+
+```
+Rails.application.configure do
+  # Settings specified here will take precedence over those in config/application.rb.
+
+. . .
+  config.log_level = :info
+  config.lograge.enabled = true
+  config.lograge.formatter = Lograge::Formatters::Logstash.new
+  config.logger = LogStashLogger.new(type: :tcp, host: 'logstash.example.com', port: 2020)
+end
+```
+
+我们有4个可配置选项。第一个，`config.log_level`，是Rails日志级别的设置，我们可以让Rails只记录`:info`级别或更高级别的日志事件。Rails日志在默认情况下是`:debug`级别。我们一般不需要这么多细节。第二个选项，`config.lograge.enabled`开启Lograge，接管Rails对request的默认日志。第三个选项，
+`config.lograge.formatter`控制输入的日志事件的格式，在这里我们使用Logstash的事件格式。Lograge还有[许多其他的可用格式](https://github.com/roidrage/lograge)包括原生JSON。最后一个选项，`config.logger`，用Logstash-logger接管默认的Rails日志记录。它生成一个`LogStashLogger`类的实例连接到我们的Logstash服务器，通过TCP连接到`logstash.example.com`的`2020`端口上.
+
+看一下Logstash服务器上相应的配置。需要增加一个新的`tcp`输入来接受我们的应用程序事件。
+
+```
+input {
+  tcp {
+    port  => 2020
+    type  => "apps"
+    codec => "json"
+  }
+. . .
+```
+
+可以看到我们在`2020`端口添加了一个`tcp`输入。我们给所有在这输入上接收到的事件设置了一个`apps`的`type`，并且使用`json` codec来将所有输入的事件格式从JSON解析为Logstash。重启Logstash来启用我们的配置。
+
+```
+$ sudo service logstash restart
+```
+
+这东西在示例应用程序里起了什么作用？一个配置好的Lograge会将Rails默认的请求日志转换得更为结构化和更加有用。一个传统的请求日志可能会像下面这样：
+
+```
+Started GET "/" for 127.0.0.1 at 2015-12-10 09:21:45 +0400
+Processing by UsersController#index as HTML
+  Rendered users/_user.html.erb (6.0ms)
+Completed 200 OK in 79ms (Views: 78.8ms | ActiveRecord: 0.0ms)
+```
+
+用了Lograge能使日志请求会变成下面这样：
+
+```json
+{
+  "method":"GET",
+  "path":"/users",
+  "format":"html",
+  "controller":"users",
+  "action":"index",
+  "status":200,
+  "duration":189.35,
+  "view":186.35,
+  "db":0.92,
+  "@timestamp":"2015-12-11T13:35:47.062+00:00",
+  "@version":"1",
+  "message":"[200] GET /users (users#index)",
+  "severity":"INFO",
+  "host":"app1-web1",
+  "type":"apps"
+}
+```
+
+可以看到事件以Logstash格式包含着`user_deleted`消息和`@user`实例变量结构化为`user`hash后的内容。当一个用户被删除，这个事件将被传到Logstash后再处理和保存。你可以看到现在就有更多的细节来帮助我们诊断问题和追踪事件。
+
+这是关于用结构化日志来监控你的应用如此方便的一个简单例子。你可以在各种语言和框架应用这里论述的基本理论。
+
+## 结构化日志库
+
+帮你开个头，这里有一些结构化日志库和给各种语言和框架的整合。网上搜一下也能找到一些其他的。
+
+## Java
+
+Java社区有一个强大的[Log4j](http://logging.apache.org/log4j/)，有着高配置性和灵活性。
+
+## Go
+
+Golan有[Logrus](https://github.com/Sirupsen/logrus)，用结构化的数据扩展了标准日志记录库。
+
+## Clojure
+
+Clojure有两个很棒的结构化日志实现。一个叫[Puppet Labs](https://github.com/puppetlabs/structured-logging)还有一个叫[clj-log](https://github.com/yogthos/clj-log)。
+
+## Ruby & Rails
+
+我们已经看到了[Lograge](https://github.com/roidrage/lograge)在Ruby and Rails里的应用。其他的例子还有[Semantic Logger](https://github.com/rocketjob/semantic_logger)和[ruby-cabin](https://github.com/jordansissel/ruby-cabin)。
+
+## Python
+
+Python里有[Structlog](https://github.com/hynek/structlog)用结构化数据增强已有的日志方法。
+
+## Javascript & Node.JS
+
+Javascript (和 Node) 有一个.Net’s Serilog的实现叫作[Structured Log](https://github.com/structured-log/structured-log). 还有一个是[Bunyan](https://github.com/trentm/node-bunyan)。
+
+## .Net
+
+.Net 框架有[Serilog](http://serilog.net/)。
